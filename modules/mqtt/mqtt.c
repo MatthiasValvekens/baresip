@@ -4,6 +4,8 @@
  * Copyright (C) 2017 Alfred E. Heggestad
  */
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <mosquitto.h>
 #include <re.h>
 #include <baresip.h>
@@ -15,8 +17,12 @@ static char broker_host[256] = "127.0.0.1";
 static char broker_cafile[256] = "";
 /* Authentication user name, default none */
 static char mqttusername[256] = "";
+/* Authentication username file, default none */
+static char mqttusernamefile[256] = "";
 /* Authentication password, default none */
-static char mqttpassword[256] = "";
+static char mqttpassword[2048] = "";
+/* Authentication password file, default none */
+static char mqttpasswordfile[256] = "";
 /* Client ID - default "baresip" */
 static char mqttclientid[256] = "baresip";
 /* Base topic for MQTT - default "baresip" - i.e. /baresip/event */
@@ -53,6 +59,42 @@ static void tmr_handler(void *data)
 	}
 }
 
+static void read_credential_from_file(char *path, char *dst, int max) {
+	if (*path == '\0') {
+		return;
+	}
+
+	FILE *file = fopen(path, "r");
+	if (file && fgets(dst, max, file) != NULL) {
+		return;
+	}
+
+	warning("mqtt: failed to read from credential file %s (%d)\n", path, errno);
+	*dst = '\0';
+}
+
+static int refresh_credentials(struct mosquitto *mosq) {
+	int ret;
+
+	if (*mqttpasswordfile != '\0' || *mqttusernamefile != '\0') {
+		read_credential_from_file(
+			mqttusernamefile, mqttusername, sizeof(mqttusername));
+		read_credential_from_file(
+			mqttpasswordfile, mqttpassword, sizeof(mqttpassword));
+
+		if (*mqttusername != '\0') {
+			ret = mosquitto_username_pw_set(mosq, mqttusername,
+				mqttpassword);
+			if (ret != MOSQ_ERR_SUCCESS)
+				return ret == MOSQ_ERR_ERRNO ? errno : EIO;
+		}
+		return 0;
+	} else {
+		return -1;
+	}
+}
+
+
 
 /*
  * This is called when the broker sends a CONNACK message
@@ -85,6 +127,7 @@ static void tmr_reconnect(void *data)
 	struct mqtt *mqtt = data;
 	int err;
 
+	refresh_credentials(mqtt->mosq);
 	err = mosquitto_reconnect(mqtt->mosq);
 	if (err == MOSQ_ERR_SUCCESS) {
 		mqtt->fd = mosquitto_socket(mqtt->mosq);
@@ -120,7 +163,6 @@ static void disconnect_callback(struct mosquitto *mosq, void *obj, int rc)
 	tmr_start(&mqtt->tmr, 1000, tmr_reconnect, mqtt);
 }
 
-
 static int module_init(void)
 {
 	const int keepalive = 60;
@@ -138,8 +180,12 @@ static int module_init(void)
 		     broker_cafile, sizeof(broker_cafile));
 	conf_get_str(conf_cur(), "mqtt_broker_user",
 		     mqttusername, sizeof(mqttusername));
+	conf_get_str(conf_cur(), "mqtt_broker_username_file",
+		     mqttusernamefile, sizeof(mqttusernamefile));
 	conf_get_str(conf_cur(), "mqtt_broker_password",
 		     mqttpassword, sizeof(mqttpassword));
+	conf_get_str(conf_cur(), "mqtt_broker_password_file",
+		     mqttpasswordfile, sizeof(mqttpasswordfile));
 	conf_get_str(conf_cur(), "mqtt_broker_clientid",
 		     mqttclientid, sizeof(mqttclientid));
 	conf_get_str(conf_cur(), "mqtt_basetopic",
@@ -183,11 +229,14 @@ static int module_init(void)
 	mosquitto_connect_callback_set(s_mqtt.mosq, connect_callback);
 	mosquitto_disconnect_callback_set(s_mqtt.mosq, disconnect_callback);
 
-	if (*mqttusername != '\0') {
+	ret = refresh_credentials(s_mqtt.mosq);
+	if (ret == -1 && *mqttusername != '\0') {
 		ret = mosquitto_username_pw_set(s_mqtt.mosq, mqttusername,
-			mqttpassword);
+				mqttpassword);
 		if (ret != MOSQ_ERR_SUCCESS)
 			return ret == MOSQ_ERR_ERRNO ? errno : EIO;
+	} else if (ret) {
+		return ret;
 	}
 
 	if (*broker_cafile != '\0') {
